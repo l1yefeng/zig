@@ -168,6 +168,42 @@ const Branch = struct {
         self.inst_table.deinit(gpa);
         self.* = undefined;
     }
+
+    const FormatContext = struct {
+        insts: []const Air.Inst.Index,
+        mcvs: []const MCValue,
+    };
+
+    fn fmt(
+        ctx: FormatContext,
+        comptime unused_format_string: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        _ = options;
+        comptime assert(unused_format_string.len == 0);
+        try writer.writeAll("Branch {\n");
+        for (ctx.insts) |inst, i| {
+            const mcv = ctx.mcvs[i];
+            try writer.print("  %{d} => {}\n", .{ inst, mcv });
+        }
+        try writer.writeAll("}");
+    }
+
+    fn format(branch: Branch, comptime unused_format_string: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = branch;
+        _ = unused_format_string;
+        _ = options;
+        _ = writer;
+        @compileError("do not format Branch directly; use ty.fmtDebug()");
+    }
+
+    fn fmtDebug(self: @This()) std.fmt.Formatter(fmt) {
+        return .{ .data = .{
+            .insts = self.inst_table.keys(),
+            .mcvs = self.inst_table.values(),
+        } };
+    }
 };
 
 const StackAllocation = struct {
@@ -779,6 +815,7 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
 fn processDeath(self: *Self, inst: Air.Inst.Index) void {
     const air_tags = self.air.instructions.items(.tag);
     if (air_tags[inst] == .constant) return; // Constants are immortal.
+    log.debug("%{d} => {}", .{ inst, MCValue{ .dead = {} } });
     // When editing this function, note that the logic must synchronize with `reuseOperand`.
     const prev_value = self.getResolvedInstValue(inst);
     const branch = &self.branch_stack.items[self.branch_stack.items.len - 1];
@@ -946,9 +983,42 @@ fn allocRegOrMem(self: *Self, elem_ty: Type, reg_ok: bool, maybe_inst: ?Air.Inst
     return MCValue{ .stack_offset = stack_offset };
 }
 
+const State = struct {
+    next_stack_offset: u32,
+    registers: abi.RegisterManager.TrackedRegisters,
+    free_registers: abi.RegisterManager.RegisterBitSet,
+    compare_flags_inst: ?Air.Inst.Index,
+    stack: std.AutoHashMapUnmanaged(u32, StackAllocation),
+
+    fn deinit(state: *State, gpa: Allocator) void {
+        state.stack.deinit(gpa);
+    }
+};
+
+fn captureState(self: *Self) !State {
+    return State{
+        .next_stack_offset = self.next_stack_offset,
+        .registers = self.register_manager.registers,
+        .free_registers = self.register_manager.free_registers,
+        .compare_flags_inst = self.compare_flags_inst,
+        .stack = try self.stack.clone(self.gpa),
+    };
+}
+
+fn revertState(self: *Self, state: State) void {
+    self.register_manager.registers = state.registers;
+    self.compare_flags_inst = state.compare_flags_inst;
+
+    self.stack.deinit(self.gpa);
+    self.stack = state.stack;
+
+    self.next_stack_offset = state.next_stack_offset;
+    self.register_manager.free_registers = state.free_registers;
+}
+
 pub fn spillInstruction(self: *Self, reg: Register, inst: Air.Inst.Index) !void {
     const stack_mcv = try self.allocRegOrMem(self.air.typeOfIndex(inst), false, inst);
-    log.debug("spilling {d} to stack mcv {any}", .{ inst, stack_mcv });
+    log.debug("spilling %{d} to stack mcv {any}", .{ inst, stack_mcv });
 
     const reg_mcv = self.getResolvedInstValue(inst);
     switch (reg_mcv) {
@@ -1608,6 +1678,7 @@ fn allocRegs(
             if (arg.bind == .inst) {
                 const branch = &self.branch_stack.items[self.branch_stack.items.len - 1];
                 const inst = Air.refToIndex(arg.bind.inst).?;
+                log.debug("allocRegs %{d} => {}", .{ inst, arg.reg.* });
 
                 // Overwrite the MCValue associated with this inst
                 branch.inst_table.putAssumeCapacity(inst, .{ .register = arg.reg.* });
@@ -4009,6 +4080,7 @@ fn airFence(self: *Self) !void {
 }
 
 fn airCall(self: *Self, inst: Air.Inst.Index, modifier: std.builtin.CallOptions.Modifier) !void {
+    log.debug("airCall %{d}", .{inst});
     if (modifier == .always_tail) return self.fail("TODO implement tail calls for aarch64", .{});
     const pl_op = self.air.instructions.items(.data)[inst].pl_op;
     const callee = pl_op.operand;
@@ -4489,6 +4561,8 @@ fn condBr(self: *Self, condition: MCValue) !Mir.Inst.Index {
                 else => try self.copyToTmpRegister(Type.bool, condition),
             };
 
+            try self.spillCompareFlagsIfOccupied();
+
             return try self.addInst(.{
                 .tag = .cbz,
                 .data = .{
@@ -4524,12 +4598,7 @@ fn airCondBr(self: *Self, inst: Air.Inst.Index) !void {
     }
 
     // Capture the state of register and stack allocation state so that we can revert to it.
-    const parent_next_stack_offset = self.next_stack_offset;
-    const parent_free_registers = self.register_manager.free_registers;
-    var parent_stack = try self.stack.clone(self.gpa);
-    defer parent_stack.deinit(self.gpa);
-    const parent_registers = self.register_manager.registers;
-    const parent_compare_flags_inst = self.compare_flags_inst;
+    const saved_state = try self.captureState();
 
     try self.branch_stack.append(.{});
     errdefer {
@@ -4544,28 +4613,26 @@ fn airCondBr(self: *Self, inst: Air.Inst.Index) !void {
 
     // Revert to the previous register and stack allocation state.
 
-    var saved_then_branch = self.branch_stack.pop();
-    defer saved_then_branch.deinit(self.gpa);
+    var then_branch = self.branch_stack.pop();
+    defer then_branch.deinit(self.gpa);
 
-    self.register_manager.registers = parent_registers;
-    self.compare_flags_inst = parent_compare_flags_inst;
-
-    self.stack.deinit(self.gpa);
-    self.stack = parent_stack;
-    parent_stack = .{};
-
-    self.next_stack_offset = parent_next_stack_offset;
-    self.register_manager.free_registers = parent_free_registers;
+    self.revertState(saved_state);
 
     try self.performReloc(reloc);
-    const else_branch = self.branch_stack.addOneAssumeCapacity();
-    else_branch.* = .{};
+
+    try self.branch_stack.append(.{});
+    errdefer {
+        _ = self.branch_stack.pop();
+    }
 
     try self.ensureProcessDeathCapacity(liveness_condbr.else_deaths.len);
     for (liveness_condbr.else_deaths) |operand| {
         self.processDeath(operand);
     }
     try self.genBody(else_body);
+
+    var else_branch = self.branch_stack.pop();
+    defer else_branch.deinit(self.gpa);
 
     // At this point, each branch will possibly have conflicting values for where
     // each instruction is stored. They agree, however, on which instructions are alive/dead.
@@ -4575,77 +4642,87 @@ fn airCondBr(self: *Self, inst: Air.Inst.Index) !void {
     // that we can use all the code emitting abstractions. This is why at the bottom we
     // assert that parent_branch.free_registers equals the saved_then_branch.free_registers
     // rather than assigning it.
-    const parent_branch = &self.branch_stack.items[self.branch_stack.items.len - 2];
-    try parent_branch.inst_table.ensureUnusedCapacity(self.gpa, else_branch.inst_table.count());
+    log.debug("airCondBr: %{d}", .{inst});
+    log.debug("Upper branches:", .{});
+    for (self.branch_stack.items) |bs| {
+        log.debug("{}", .{bs.fmtDebug()});
+    }
 
-    const else_slice = else_branch.inst_table.entries.slice();
-    const else_keys = else_slice.items(.key);
-    const else_values = else_slice.items(.value);
-    for (else_keys) |else_key, else_idx| {
-        const else_value = else_values[else_idx];
-        const canon_mcv = if (saved_then_branch.inst_table.fetchSwapRemove(else_key)) |then_entry| blk: {
+    log.debug("Then branch: {}", .{then_branch.fmtDebug()});
+    log.debug("Else branch: {}", .{else_branch.fmtDebug()});
+
+    const parent_branch = &self.branch_stack.items[self.branch_stack.items.len - 1];
+    try self.canonicaliseBranches(parent_branch, &then_branch, &else_branch);
+
+    // We already took care of pl_op.operand earlier, so we're going
+    // to pass .none here
+    return self.finishAir(inst, .unreach, .{ .none, .none, .none });
+}
+
+fn canonicaliseBranches(self: *Self, parent_branch: *Branch, canon_branch: *Branch, target_branch: *Branch) !void {
+    try parent_branch.inst_table.ensureUnusedCapacity(self.gpa, target_branch.inst_table.count());
+
+    const target_slice = target_branch.inst_table.entries.slice();
+    const target_keys = target_slice.items(.key);
+    const target_values = target_slice.items(.value);
+
+    for (target_keys) |target_key, target_idx| {
+        const target_value = target_values[target_idx];
+        const canon_mcv = if (canon_branch.inst_table.fetchSwapRemove(target_key)) |canon_entry| blk: {
             // The instruction's MCValue is overridden in both branches.
-            parent_branch.inst_table.putAssumeCapacity(else_key, then_entry.value);
-            if (else_value == .dead) {
-                assert(then_entry.value == .dead);
+            parent_branch.inst_table.putAssumeCapacity(target_key, canon_entry.value);
+            if (target_value == .dead) {
+                assert(canon_entry.value == .dead);
                 continue;
             }
-            break :blk then_entry.value;
+            break :blk canon_entry.value;
         } else blk: {
-            if (else_value == .dead)
+            if (target_value == .dead)
                 continue;
             // The instruction is only overridden in the else branch.
             var i: usize = self.branch_stack.items.len - 1;
             while (true) {
                 i -= 1; // If this overflows, the question is: why wasn't the instruction marked dead?
-                if (self.branch_stack.items[i].inst_table.get(else_key)) |mcv| {
+                if (self.branch_stack.items[i].inst_table.get(target_key)) |mcv| {
                     assert(mcv != .dead);
                     break :blk mcv;
                 }
             }
         };
-        log.debug("consolidating else_entry {d} {}=>{}", .{ else_key, else_value, canon_mcv });
+        log.debug("consolidating target_entry {d} {}=>{}", .{ target_key, target_value, canon_mcv });
         // TODO make sure the destination stack offset / register does not already have something
         // going on there.
-        try self.setRegOrMem(self.air.typeOfIndex(else_key), canon_mcv, else_value);
+        try self.setRegOrMem(self.air.typeOfIndex(target_key), canon_mcv, target_value);
         // TODO track the new register / stack allocation
     }
-    try parent_branch.inst_table.ensureUnusedCapacity(self.gpa, saved_then_branch.inst_table.count());
-    const then_slice = saved_then_branch.inst_table.entries.slice();
-    const then_keys = then_slice.items(.key);
-    const then_values = then_slice.items(.value);
-    for (then_keys) |then_key, then_idx| {
-        const then_value = then_values[then_idx];
-        // We already deleted the items from this table that matched the else_branch.
-        // So these are all instructions that are only overridden in the then branch.
-        parent_branch.inst_table.putAssumeCapacity(then_key, then_value);
-        if (then_value == .dead)
+    try parent_branch.inst_table.ensureUnusedCapacity(self.gpa, canon_branch.inst_table.count());
+    const canon_slice = canon_branch.inst_table.entries.slice();
+    const canon_keys = canon_slice.items(.key);
+    const canon_values = canon_slice.items(.value);
+    for (canon_keys) |canon_key, canon_idx| {
+        const canon_value = canon_values[canon_idx];
+        // We already deleted the items from this table that matched the target_branch.
+        // So these are all instructions that are only overridden in the canon branch.
+        parent_branch.inst_table.putAssumeCapacity(canon_key, canon_value);
+        log.debug("canon_value = {}", .{canon_value});
+        if (canon_value == .dead)
             continue;
         const parent_mcv = blk: {
             var i: usize = self.branch_stack.items.len - 1;
             while (true) {
                 i -= 1;
-                if (self.branch_stack.items[i].inst_table.get(then_key)) |mcv| {
+                if (self.branch_stack.items[i].inst_table.get(canon_key)) |mcv| {
                     assert(mcv != .dead);
                     break :blk mcv;
                 }
             }
         };
-        log.debug("consolidating then_entry {d} {}=>{}", .{ then_key, parent_mcv, then_value });
+        log.debug("consolidating canon_entry {d} {}=>{}", .{ canon_key, parent_mcv, canon_value });
         // TODO make sure the destination stack offset / register does not already have something
         // going on there.
-        try self.setRegOrMem(self.air.typeOfIndex(then_key), parent_mcv, then_value);
+        try self.setRegOrMem(self.air.typeOfIndex(canon_key), parent_mcv, canon_value);
         // TODO track the new register / stack allocation
     }
-
-    {
-        var item = self.branch_stack.pop();
-        item.deinit(self.gpa);
-    }
-
-    // We already took care of pl_op.operand earlier, so we're going
-    // to pass .none here
-    return self.finishAir(inst, .unreach, .{ .none, .none, .none });
 }
 
 fn isNull(self: *Self, operand_bind: ReadArg.Bind, operand_ty: Type) !MCValue {
@@ -5980,6 +6057,7 @@ fn genTypedValue(self: *Self, arg_tv: TypedValue) InnerError!MCValue {
     log.debug("genTypedValue: ty = {}, val = {}", .{ typed_value.ty.fmtDebug(), typed_value.val.fmtDebug() });
     if (typed_value.val.isUndef())
         return MCValue{ .undef = {} };
+    const ptr_bits = self.target.cpu.arch.ptrBitWidth();
 
     if (typed_value.val.castTag(.decl_ref)) |payload| {
         return self.lowerDeclRef(typed_value, payload.data);
@@ -5987,9 +6065,11 @@ fn genTypedValue(self: *Self, arg_tv: TypedValue) InnerError!MCValue {
     if (typed_value.val.castTag(.decl_ref_mut)) |payload| {
         return self.lowerDeclRef(typed_value, payload.data.decl_index);
     }
+
     const target = self.target.*;
 
     switch (typed_value.ty.zigTypeTag()) {
+        .Void => return MCValue{ .none = {} },
         .Pointer => switch (typed_value.ty.ptrSize()) {
             .Slice => {},
             else => {
@@ -6003,16 +6083,11 @@ fn genTypedValue(self: *Self, arg_tv: TypedValue) InnerError!MCValue {
         },
         .Int => {
             const info = typed_value.ty.intInfo(self.target.*);
-            if (info.bits <= 64) {
-                const unsigned = switch (info.signedness) {
-                    .signed => blk: {
-                        const signed = typed_value.val.toSignedInt();
-                        break :blk @bitCast(u64, signed);
-                    },
-                    .unsigned => typed_value.val.toUnsignedInt(target),
-                };
-
-                return MCValue{ .immediate = unsigned };
+            if (info.bits <= ptr_bits and info.signedness == .signed) {
+                return MCValue{ .immediate = @bitCast(u64, typed_value.val.toSignedInt()) };
+            }
+            if (!(info.bits > ptr_bits or info.signedness == .signed)) {
+                return MCValue{ .immediate = typed_value.val.toUnsignedInt(target) };
             }
         },
         .Bool => {
@@ -6029,7 +6104,7 @@ fn genTypedValue(self: *Self, arg_tv: TypedValue) InnerError!MCValue {
                     .val = typed_value.val,
                 });
             } else if (typed_value.ty.abiSize(self.target.*) == 1) {
-                return MCValue{ .immediate = @boolToInt(typed_value.val.isNull()) };
+                return MCValue{ .immediate = @boolToInt(!typed_value.val.isNull()) };
             }
         },
         .Enum => {
@@ -6073,7 +6148,6 @@ fn genTypedValue(self: *Self, arg_tv: TypedValue) InnerError!MCValue {
         .ErrorUnion => {
             const error_type = typed_value.ty.errorUnionSet();
             const payload_type = typed_value.ty.errorUnionPayload();
-
             const is_pl = typed_value.val.errorUnionIsPayload();
 
             if (!payload_type.hasRuntimeBitsIgnoreComptime()) {
@@ -6081,15 +6155,12 @@ fn genTypedValue(self: *Self, arg_tv: TypedValue) InnerError!MCValue {
                 const err_val = if (!is_pl) typed_value.val else Value.initTag(.zero);
                 return self.genTypedValue(.{ .ty = error_type, .val = err_val });
             }
-
-            return self.lowerUnnamedConst(typed_value);
         },
 
-        .ComptimeInt => unreachable, // semantic analysis prevents this
-        .ComptimeFloat => unreachable, // semantic analysis prevents this
+        .ComptimeInt => unreachable,
+        .ComptimeFloat => unreachable,
         .Type => unreachable,
         .EnumLiteral => unreachable,
-        .Void => unreachable,
         .NoReturn => unreachable,
         .Undefined => unreachable,
         .Null => unreachable,

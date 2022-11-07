@@ -3880,6 +3880,7 @@ fn airFence(self: *Self) !void {
 }
 
 fn airCall(self: *Self, inst: Air.Inst.Index, modifier: std.builtin.CallOptions.Modifier) !void {
+    log.debug("airCall %{d}", .{inst});
     if (modifier == .always_tail) return self.fail("TODO implement tail calls for x86_64", .{});
     const pl_op = self.air.instructions.items(.data)[inst].pl_op;
     const callee = pl_op.operand;
