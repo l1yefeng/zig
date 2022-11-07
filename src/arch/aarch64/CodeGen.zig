@@ -37,6 +37,7 @@ const Register = bits.Register;
 const Instruction = bits.Instruction;
 const Condition = bits.Instruction.Condition;
 const callee_preserved_regs = abi.callee_preserved_regs;
+const caller_preserved_regs = abi.caller_preserved_regs;
 const c_abi_int_param_regs = abi.c_abi_int_param_regs;
 const c_abi_int_return_regs = abi.c_abi_int_return_regs;
 const gp = abi.RegisterClass.gp;
@@ -4034,25 +4035,33 @@ fn airCall(self: *Self, inst: Air.Inst.Index, modifier: std.builtin.CallOptions.
     // saving compare flags may require a new caller-saved register
     try self.spillCompareFlagsIfOccupied();
 
-    if (info.return_value == .stack_offset) {
-        log.debug("airCall: return by reference", .{});
+    // Save caller-saved registers, but crucially *after* we save the
+    // compare flags as saving compare flags may require a new
+    // caller-saved register
+    for (caller_preserved_regs) |reg| {
+        try self.register_manager.getReg(reg, null);
+    }
+
+    const x0_lock: ?RegisterLock = if (info.return_value == .stack_offset) blk: {
+        log.debug("airCall(%{d}): return by reference", .{inst});
         const ret_ty = fn_ty.fnReturnType();
         const ret_abi_size = @intCast(u32, ret_ty.abiSize(self.target.*));
         const ret_abi_align = @intCast(u32, ret_ty.abiAlignment(self.target.*));
         const stack_offset = try self.allocMem(ret_abi_size, ret_abi_align, inst);
-
-        const ret_ptr_reg = self.registerAlias(.x0, Type.usize);
 
         var ptr_ty_payload: Type.Payload.ElemType = .{
             .base = .{ .tag = .single_mut_pointer },
             .data = ret_ty,
         };
         const ptr_ty = Type.initPayload(&ptr_ty_payload.base);
-        try self.register_manager.getReg(ret_ptr_reg, null);
-        try self.genSetReg(ptr_ty, ret_ptr_reg, .{ .ptr_stack_offset = stack_offset });
+        try self.register_manager.getReg(.x0, null);
+        try self.genSetReg(ptr_ty, .x0, .{ .ptr_stack_offset = stack_offset });
 
         info.return_value = .{ .stack_offset = stack_offset };
-    }
+
+        break :blk self.register_manager.lockRegAssumeUnused(.x0);
+    } else null;
+    defer if (x0_lock) |lock| self.register_manager.unlockReg(lock);
 
     // Make space for the arguments passed via the stack
     self.max_end_stack += info.stack_byte_count;
