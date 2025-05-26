@@ -726,6 +726,47 @@ test "zip verify filenames" {
     try testZipError(error.ZipFilenameHasBackslash, .{ .name = "foo\\bar", .content = "", .compression = .store }, .{});
 }
 
+test "zip extract file to buffer" {
+    const test_files = [_]File{
+        .{ .name = "a.txt", .content = "aaa", .compression = .store },
+    };
+
+    var extracted = std.ArrayList(u8).init(std.testing.allocator);
+    defer extracted.deinit();
+    var extractor = struct {
+        writer: ArrayList.Writer,
+
+        const ArrayList = std.ArrayList(u8);
+        const Extractor = @This();
+        const VirtualFile = struct {
+            context: *Extractor,
+            fn writer(self: @This()) ArrayList.Writer {
+                return self.context.writer;
+            }
+            fn close(_: @This()) void {}
+        };
+        fn openDir(_: @This(), _: []u8) !VirtualFile {
+            unreachable;
+        }
+        fn openFile(self: *@This(), _: []u8) !VirtualFile {
+            return VirtualFile{ .context = self };
+        }
+    }{ .writer = extracted.writer() };
+
+    var zip_buf: [4096]u8 = undefined;
+    var store: [test_files.len]FileStore = undefined;
+    var fbs = try testutil.makeZipWithStore(&zip_buf, &test_files, .{}, &store);
+    const stream = fbs.seekableStream();
+
+    var iter = try Iterator(@TypeOf(stream)).init(stream);
+    const entry = (try iter.next()).?;
+    var filename_buf: [8]u8 = undefined;
+    _ = try entry.extract_to(stream, .{}, &filename_buf, &extractor);
+
+    const content = comptime test_files[0].content;
+    try std.testing.expectEqualSlices(u8, content, extracted.items);
+}
+
 test "zip64" {
     const test_files = [_]File{
         .{ .name = "fram", .content = "fram foo fro fraba", .compression = .store },
