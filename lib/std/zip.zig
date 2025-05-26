@@ -435,12 +435,14 @@ pub fn Iterator(comptime SeekableStream: type) type {
             uncompressed_size: u64,
             file_offset: u64,
 
-            pub fn extract(
+            /// Extract this entry. `extractor` must implement `openFile` and `openDir`.
+            /// See also `extract`.
+            pub fn extract_to(
                 self: Entry,
                 stream: SeekableStream,
                 options: ExtractOptions,
                 filename_buf: []u8,
-                dest: std.fs.Dir,
+                extractor: anytype,
             ) !u32 {
                 if (filename_buf.len < self.filename_len)
                     return error.ZipInsufficientBuffer;
@@ -532,40 +534,67 @@ pub fn Iterator(comptime SeekableStream: type) type {
                 if (filename[filename.len - 1] == '/') {
                     if (self.uncompressed_size != 0)
                         return error.ZipBadDirectorySize;
-                    try dest.makePath(filename[0 .. filename.len - 1]);
+                    var dir = try extractor.openDir(filename[0 .. filename.len - 1]);
+                    dir.close();
                     return std.hash.Crc32.hash(&.{});
                 }
 
-                const out_file = blk: {
-                    if (std.fs.path.dirname(filename)) |dirname| {
-                        var parent_dir = try dest.makeOpenPath(dirname, .{});
-                        defer parent_dir.close();
-
-                        const basename = std.fs.path.basename(filename);
-                        break :blk try parent_dir.createFile(basename, .{ .exclusive = true });
-                    }
-                    break :blk try dest.createFile(filename, .{ .exclusive = true });
-                };
-                defer out_file.close();
                 const local_data_file_offset: u64 =
                     @as(u64, self.file_offset) +
                     @as(u64, @sizeOf(LocalFileHeader)) +
                     local_data_header_offset;
                 try stream.seekTo(local_data_file_offset);
                 var limited_reader = std.io.limitedReader(stream.context.reader(), self.compressed_size);
+                var file = try extractor.openFile(filename);
+                defer file.close();
                 const crc = try decompress(
                     self.compression_method,
                     self.uncompressed_size,
                     limited_reader.reader(),
-                    out_file.writer(),
+                    file.writer(),
                 );
                 if (limited_reader.bytes_left != 0)
                     return error.ZipDecompressTruncated;
                 return crc;
             }
+
+            /// Extract this entry to the file system.
+            pub fn extract(
+                self: Entry,
+                stream: SeekableStream,
+                options: ExtractOptions,
+                filename_buf: []u8,
+                dest: std.fs.Dir,
+            ) !u32 {
+                return self.extract_to(stream, options, filename_buf, FsExtractor{ .dest = dest });
+            }
         };
     };
 }
+
+const FsExtractor = struct {
+    dest: std.fs.Dir,
+
+    const VirtualDir = struct {
+        fn close(_: VirtualDir) void {}
+    };
+
+    fn openDir(self: @This(), name: []u8) !VirtualDir {
+        try self.dest.makePath(name);
+        return VirtualDir{};
+    }
+
+    fn openFile(self: @This(), name: []u8) !std.fs.File {
+        if (std.fs.path.dirname(name)) |dirname| {
+            var parent_dir = try self.dest.makeOpenPath(dirname, .{});
+            defer parent_dir.close();
+
+            const basename = std.fs.path.basename(name);
+            return try parent_dir.createFile(basename, .{ .exclusive = true });
+        }
+        return try self.dest.createFile(name, .{ .exclusive = true });
+    }
+};
 
 // returns true if `filename` starts with `root` followed by a forward slash
 fn filenameInRoot(filename: []const u8, root: []const u8) bool {
