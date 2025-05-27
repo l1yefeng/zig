@@ -435,7 +435,7 @@ pub fn Iterator(comptime SeekableStream: type) type {
             uncompressed_size: u64,
             file_offset: u64,
 
-            /// Extract this entry. `extractor` must implement `createFile` and `createDir`.
+            /// Extract this entry. `extract_context` must implement `createFile` and `createDir`.
             /// The return type of `createFile` must implement `writer` and `close`.
             /// See also `extract`.
             pub fn extract_to(
@@ -443,7 +443,7 @@ pub fn Iterator(comptime SeekableStream: type) type {
                 stream: SeekableStream,
                 options: ExtractOptions,
                 filename_buf: []u8,
-                extractor: anytype,
+                extract_context: anytype,
             ) !u32 {
                 if (filename_buf.len < self.filename_len)
                     return error.ZipInsufficientBuffer;
@@ -535,7 +535,7 @@ pub fn Iterator(comptime SeekableStream: type) type {
                 if (filename[filename.len - 1] == '/') {
                     if (self.uncompressed_size != 0)
                         return error.ZipBadDirectorySize;
-                    try extractor.createDir(filename[0 .. filename.len - 1]);
+                    try extract_context.createDir(filename[0 .. filename.len - 1]);
                     return std.hash.Crc32.hash(&.{});
                 }
 
@@ -545,7 +545,7 @@ pub fn Iterator(comptime SeekableStream: type) type {
                     local_data_header_offset;
                 try stream.seekTo(local_data_file_offset);
                 var limited_reader = std.io.limitedReader(stream.context.reader(), self.compressed_size);
-                var file = try extractor.createFile(filename);
+                var file = try extract_context.createFile(filename);
                 defer file.close();
                 const crc = try decompress(
                     self.compression_method,
@@ -566,13 +566,13 @@ pub fn Iterator(comptime SeekableStream: type) type {
                 filename_buf: []u8,
                 dest: std.fs.Dir,
             ) !u32 {
-                return self.extract_to(stream, options, filename_buf, FsExtractor{ .dest = dest });
+                return self.extract_to(stream, options, filename_buf, FsExtractContext{ .dest = dest });
             }
         };
     };
 }
 
-const FsExtractor = struct {
+const FsExtractContext = struct {
     dest: std.fs.Dir,
 
     fn createDir(self: @This(), name: []u8) !void {
@@ -721,14 +721,14 @@ test "zip verify filenames" {
     try testZipError(error.ZipFilenameHasBackslash, .{ .name = "foo\\bar", .content = "", .compression = .store }, .{});
 }
 
-test "zip extract file to memory" {
+test "zip extract to memory" {
     const test_files = [_]File{
         .{ .name = "a.txt", .content = "aaa", .compression = .store },
     };
 
     var extracted = std.ArrayList(u8).init(std.testing.allocator);
     defer extracted.deinit();
-    var extractor = struct {
+    var ctx = struct {
         writer: std.ArrayList(u8).Writer,
 
         const Extractor = @This();
@@ -753,7 +753,7 @@ test "zip extract file to memory" {
     var iter = try Iterator(@TypeOf(stream)).init(stream);
     const entry = (try iter.next()).?;
     var filename_buf: [8]u8 = undefined;
-    _ = try entry.extract_to(stream, .{}, &filename_buf, &extractor);
+    _ = try entry.extract_to(stream, .{}, &filename_buf, &ctx);
 
     const content = comptime test_files[0].content;
     try std.testing.expectEqualSlices(u8, content, extracted.items);
