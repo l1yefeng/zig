@@ -435,7 +435,8 @@ pub fn Iterator(comptime SeekableStream: type) type {
             uncompressed_size: u64,
             file_offset: u64,
 
-            /// Extract this entry. `extractor` must implement `openFile` and `openDir`.
+            /// Extract this entry. `extractor` must implement `createFile` and `createDir`.
+            /// The return type of `createFile` must implement `writer` and `close`.
             /// See also `extract`.
             pub fn extract_to(
                 self: Entry,
@@ -534,8 +535,7 @@ pub fn Iterator(comptime SeekableStream: type) type {
                 if (filename[filename.len - 1] == '/') {
                     if (self.uncompressed_size != 0)
                         return error.ZipBadDirectorySize;
-                    var dir = try extractor.openDir(filename[0 .. filename.len - 1]);
-                    dir.close();
+                    try extractor.createDir(filename[0 .. filename.len - 1]);
                     return std.hash.Crc32.hash(&.{});
                 }
 
@@ -545,7 +545,7 @@ pub fn Iterator(comptime SeekableStream: type) type {
                     local_data_header_offset;
                 try stream.seekTo(local_data_file_offset);
                 var limited_reader = std.io.limitedReader(stream.context.reader(), self.compressed_size);
-                var file = try extractor.openFile(filename);
+                var file = try extractor.createFile(filename);
                 defer file.close();
                 const crc = try decompress(
                     self.compression_method,
@@ -575,16 +575,11 @@ pub fn Iterator(comptime SeekableStream: type) type {
 const FsExtractor = struct {
     dest: std.fs.Dir,
 
-    const VirtualDir = struct {
-        fn close(_: VirtualDir) void {}
-    };
-
-    fn openDir(self: @This(), name: []u8) !VirtualDir {
+    fn createDir(self: @This(), name: []u8) !void {
         try self.dest.makePath(name);
-        return VirtualDir{};
     }
 
-    fn openFile(self: @This(), name: []u8) !std.fs.File {
+    fn createFile(self: @This(), name: []u8) !std.fs.File {
         if (std.fs.path.dirname(name)) |dirname| {
             var parent_dir = try self.dest.makeOpenPath(dirname, .{});
             defer parent_dir.close();
@@ -726,7 +721,7 @@ test "zip verify filenames" {
     try testZipError(error.ZipFilenameHasBackslash, .{ .name = "foo\\bar", .content = "", .compression = .store }, .{});
 }
 
-test "zip extract file to buffer" {
+test "zip extract file to memory" {
     const test_files = [_]File{
         .{ .name = "a.txt", .content = "aaa", .compression = .store },
     };
@@ -734,21 +729,18 @@ test "zip extract file to buffer" {
     var extracted = std.ArrayList(u8).init(std.testing.allocator);
     defer extracted.deinit();
     var extractor = struct {
-        writer: ArrayList.Writer,
+        writer: std.ArrayList(u8).Writer,
 
-        const ArrayList = std.ArrayList(u8);
         const Extractor = @This();
         const VirtualFile = struct {
             context: *Extractor,
-            fn writer(self: @This()) ArrayList.Writer {
+            fn writer(self: @This()) std.ArrayList(u8).Writer {
                 return self.context.writer;
             }
             fn close(_: @This()) void {}
         };
-        fn openDir(_: @This(), _: []u8) !VirtualFile {
-            unreachable;
-        }
-        fn openFile(self: *@This(), _: []u8) !VirtualFile {
+        fn createDir(_: @This(), _: []u8) !void {}
+        fn createFile(self: *@This(), _: []u8) !VirtualFile {
             return VirtualFile{ .context = self };
         }
     }{ .writer = extracted.writer() };
