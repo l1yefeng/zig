@@ -2223,10 +2223,7 @@ fn resolveValue(sema: *Sema, inst: Air.Inst.Ref) CompileError!?Value {
 
     if (inst.toInterned()) |ip_index| {
         const val: Value = .fromInterned(ip_index);
-
         assert(val.getVariable(zcu) == null);
-        if (val.isPtrRuntimeValue(zcu)) return null;
-
         return val;
     } else {
         // Runtime-known value.
@@ -2287,19 +2284,6 @@ fn resolveValueResolveLazy(sema: *Sema, inst: Air.Inst.Ref) CompileError!?Value 
     return try sema.resolveLazyValue((try sema.resolveValue(inst)) orelse return null);
 }
 
-/// Like `resolveValue`, but any pointer value which does not correspond
-/// to a comptime-known integer (e.g. a decl pointer) returns `null`.
-/// Lazy values are recursively resolved.
-fn resolveValueIntable(sema: *Sema, inst: Air.Inst.Ref) CompileError!?Value {
-    const val = (try sema.resolveValue(inst)) orelse return null;
-    if (sema.pt.zcu.intern_pool.getBackingAddrTag(val.toIntern())) |addr| switch (addr) {
-        .nav, .uav, .comptime_alloc, .comptime_field => return null,
-        .int => {},
-        .eu_payload, .opt_payload, .arr_elem, .field => unreachable,
-    };
-    return try sema.resolveLazyValue(val);
-}
-
 /// Value Tag may be `undef` or `variable`.
 pub fn resolveFinalDeclValue(
     sema: *Sema,
@@ -2308,31 +2292,12 @@ pub fn resolveFinalDeclValue(
     air_ref: Air.Inst.Ref,
 ) CompileError!Value {
     const zcu = sema.pt.zcu;
-
-    const val = try sema.resolveValue(air_ref) orelse {
-        const is_runtime_ptr = rt_ptr: {
-            const ip_index = air_ref.toInterned() orelse break :rt_ptr false;
-            const val: Value = .fromInterned(ip_index);
-            break :rt_ptr val.isPtrRuntimeValue(zcu);
-        };
-
-        switch (sema.failWithNeededComptime(block, src, .{ .simple = .container_var_init })) {
-            error.AnalysisFail => |e| {
-                if (sema.err != null and is_runtime_ptr) {
-                    try sema.errNote(src, sema.err.?, "threadlocal and dll imported variables have runtime-known addresses", .{});
-                }
-                return e;
-            },
-            else => |e| return e,
-        }
-    };
-
+    const val = try sema.resolveConstValue(block, src, air_ref, .{ .simple = .container_var_init });
     if (val.canMutateComptimeVarState(zcu)) {
         const ip = &zcu.intern_pool;
         const nav = ip.getNav(sema.owner.unwrap().nav_val);
         return sema.failWithContainsReferenceToComptimeVar(block, src, nav.name, "global variable", val);
     }
-
     return val;
 }
 
@@ -10144,14 +10109,19 @@ fn zirIntFromPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
     }
     const len = if (is_vector) operand_ty.vectorLen(zcu) else undefined;
     const dest_ty: Type = if (is_vector) try pt.vectorType(.{ .child = .usize_type, .len = len }) else .usize;
-    if (try sema.resolveValueIntable(operand)) |operand_val| ct: {
+
+    if (try sema.resolveValue(operand)) |operand_val| ct: {
         if (!is_vector) {
             if (operand_val.isUndef(zcu)) {
                 return Air.internedToRef((try pt.undefValue(Type.usize)).toIntern());
             }
+            const addr = try operand_val.getUnsignedIntSema(pt) orelse {
+                // Wasn't an integer pointer. This is a runtime operation.
+                break :ct;
+            };
             return Air.internedToRef((try pt.intValue(
                 Type.usize,
-                (try operand_val.toUnsignedIntSema(pt)),
+                addr,
             )).toIntern());
         }
         const new_elems = try sema.arena.alloc(InternPool.Index, len);
@@ -26514,6 +26484,7 @@ fn zirBuiltinExtern(
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     const extra = sema.code.extraData(Zir.Inst.BinNode, extended.operand).data;
+    const src = block.nodeOffset(extra.node);
     const ty_src = block.builtinCallArgSrc(extra.node, 0);
     const options_src = block.builtinCallArgSrc(extra.node, 1);
 
@@ -26568,17 +26539,15 @@ fn zirBuiltinExtern(
         },
         .owner_nav = undefined, // ignored by `getExtern`
     });
-    const extern_nav = ip.indexToKey(extern_val).@"extern".owner_nav;
 
-    return Air.internedToRef((try pt.getCoerced(Value.fromInterned(try pt.intern(.{ .ptr = .{
-        .ty = switch (ip.indexToKey(ty.toIntern())) {
-            .ptr_type => ty.toIntern(),
-            .opt_type => |child_type| child_type,
-            else => unreachable,
-        },
-        .base_addr = .{ .nav = extern_nav },
-        .byte_offset = 0,
-    } })), ty)).toIntern());
+    const uncasted_ptr = try sema.analyzeNavRef(block, src, ip.indexToKey(extern_val).@"extern".owner_nav);
+    // We want to cast to `ty`, but that isn't necessarily an allowed coercion.
+    if (try sema.resolveValue(uncasted_ptr)) |uncasted_ptr_val| {
+        const casted_ptr_val = try pt.getCoerced(uncasted_ptr_val, ty);
+        return Air.internedToRef(casted_ptr_val.toIntern());
+    } else {
+        return block.addBitCast(ty, uncasted_ptr);
+    }
 }
 
 fn zirWorkItem(
@@ -32045,7 +32014,20 @@ fn analyzeNavRefInner(sema: *Sema, block: *Block, src: LazySrcLoc, orig_nav_inde
         break :nav orig_nav_index;
     };
 
-    const ty, const alignment, const @"addrspace", const is_const = switch (ip.getNav(nav_index).status) {
+    const nav_status = ip.getNav(nav_index).status;
+
+    const is_tlv_or_dllimport = switch (nav_status) {
+        .unresolved => unreachable,
+        // dllimports go straight to `fully_resolved`; the only option is threadlocal
+        .type_resolved => |r| r.is_threadlocal,
+        .fully_resolved => |r| switch (ip.indexToKey(r.val)) {
+            .@"extern" => |e| e.is_threadlocal or e.is_dll_import,
+            .variable => |v| v.is_threadlocal,
+            else => false,
+        },
+    };
+
+    const ty, const alignment, const @"addrspace", const is_const = switch (nav_status) {
         .unresolved => unreachable,
         .type_resolved => |r| .{ r.type, r.alignment, r.@"addrspace", r.is_const },
         .fully_resolved => |r| .{ ip.typeOf(r.val), r.alignment, r.@"addrspace", zcu.navValIsConst(r.val) },
@@ -32058,9 +32040,22 @@ fn analyzeNavRefInner(sema: *Sema, block: *Block, src: LazySrcLoc, orig_nav_inde
             .address_space = @"addrspace",
         },
     });
+
+    if (is_tlv_or_dllimport) {
+        // This pointer is runtime-known; we need to emit an AIR instruction to create it.
+        return block.addInst(.{
+            .tag = .tlv_dllimport_ptr,
+            .data = .{ .ty_nav = .{
+                .ty = ptr_ty.toIntern(),
+                .nav = nav_index,
+            } },
+        });
+    }
+
     if (is_ref) {
         try sema.maybeQueueFuncBodyAnalysis(block, src, nav_index);
     }
+
     return Air.internedToRef((try pt.intern(.{ .ptr = .{
         .ty = ptr_ty.toIntern(),
         .base_addr = .{ .nav = nav_index },
